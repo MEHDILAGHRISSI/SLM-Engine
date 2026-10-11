@@ -4,10 +4,9 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-def run_benchmark(model_id: str, num_samples: int = 200):
+def run_benchmark(model_id: str, num_samples: int = 200, max_seq_len: int = 2048):
     print(f"=== Running Baseline Benchmark for: {model_id} ===")
     
-    # 1. Load test split from benchmark dataset
     print(f"Loading test dataset ({num_samples} samples)...")
     ds = load_dataset("ayshajavd/code-security-vulnerability-dataset", split=f"test[:{num_samples}]")
     
@@ -15,7 +14,6 @@ def run_benchmark(model_id: str, num_samples: int = 200):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Load model directly onto GPU in FP16 (No quantization required on Kaggle 16GB GPU)
     print("Loading model onto GPU in FP16...")
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
@@ -40,10 +38,17 @@ def run_benchmark(model_id: str, num_samples: int = 200):
             f"<|im_start|>user\nAnalysez la sécurité de ce code {lang} :\n```{lang}\n{code_snippet}\n```<|im_end|>\n"
             f"<|im_start|>assistant\n"
         )
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        
+        # Tronquage strict à 2048 tokens pour éviter l'explosion mémoire sur les longs extraits
+        inputs = tokenizer(
+            prompt, 
+            return_tensors="pt", 
+            max_length=max_seq_len, 
+            truncation=True
+        ).to(model.device)
 
         start_time = time.time()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = model.generate(
                 **inputs,
                 max_new_tokens=10,
@@ -58,7 +63,6 @@ def run_benchmark(model_id: str, num_samples: int = 200):
         y_true.append(ground_truth)
         y_pred.append(prediction)
 
-    # 3. Calculate metrics
     acc = accuracy_score(y_true, y_pred)
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
     avg_latency = sum(latencies) / len(latencies)
