@@ -3,46 +3,48 @@ import gc
 import time
 import argparse
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 DATASET_NAME = "ayshajavd/code-security-vulnerability-dataset"
 
-# Comprehensive Benchmark Suite
 DEFAULT_MODELS = [
     "Qwen/Qwen2.5-Coder-3B-Instruct",
-    "Qwen/Qwen2.5-Coder-1.5B-Instruct",
-    "Qwen/Qwen2.5-3B-Instruct",
     "google/gemma-2-2b-it",
-    "google/codegemma-7b-it",
 ]
+
+def load_balanced_dataset(dataset_name: str, total_samples: int = 1000):
+    """Loads a strictly 50% vulnerable / 50% safe test set."""
+    print(f"Loading and balancing '{dataset_name}' (50% Vulnerable / 50% Safe)...")
+    ds = load_dataset(dataset_name, split="test")
+    
+    vul_ds = ds.filter(lambda x: x["is_vulnerable"] is True)
+    safe_ds = ds.filter(lambda x: x["is_vulnerable"] is False)
+    
+    half = total_samples // 2
+    vul_subset = vul_ds.select(range(min(half, len(vul_ds))))
+    safe_subset = safe_ds.select(range(min(half, len(safe_ds))))
+    
+    balanced_ds = concatenate_datasets([vul_subset, safe_subset]).shuffle(seed=42)
+    print(f"Loaded {len(balanced_ds)} samples ({len(vul_subset)} Vulnerable, {len(safe_subset)} Safe).")
+    return balanced_ds
 
 def evaluate_model(model_id: str, dataset_samples, hf_token: str, max_seq_len: int = 2048):
     print(f"\n==================================================")
     print(f"  Evaluating Model: {model_id}")
     print(f"==================================================")
     
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
-    except Exception as e:
-        print(f"Error loading tokenizer for {model_id}: {e}")
-        return None
-
+    tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print("Loading weights onto GPU (FP16)...")
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id, 
-            torch_dtype=torch.float16,
-            device_map="auto",
-            token=hf_token
-        )
-    except Exception as e:
-        print(f"Error loading model weights for {model_id}: {e}")
-        return None
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id, 
+        torch_dtype=torch.float16,
+        device_map="auto",
+        token=hf_token
+    )
 
     y_true = []
     y_pred = []
@@ -50,7 +52,6 @@ def evaluate_model(model_id: str, dataset_samples, hf_token: str, max_seq_len: i
 
     system_prompt = "Vous êtes un agent d'analyse statique de code. Répondez UNIQUEMENT par 'VULNERABLE' ou 'SAFE'."
 
-    print(f"Running inference on {len(dataset_samples)} samples...")
     for sample in dataset_samples:
         code_snippet = sample["code"]
         lang = sample["language"]
@@ -63,7 +64,6 @@ def evaluate_model(model_id: str, dataset_samples, hf_token: str, max_seq_len: i
         try:
             prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except Exception:
-            # Fallback ChatML format if chat_template is not present
             prompt = (
                 f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
                 f"<|im_start|>user\nAnalysez la sécurité de ce code {lang} :\n```{lang}\n{code_snippet}\n```<|im_end|>\n"
@@ -97,7 +97,6 @@ def evaluate_model(model_id: str, dataset_samples, hf_token: str, max_seq_len: i
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
     avg_latency = (sum(latencies) / len(latencies)) * 1000
 
-    # Strict VRAM cleanup between model runs
     del model
     del tokenizer
     gc.collect()
@@ -114,13 +113,12 @@ def evaluate_model(model_id: str, dataset_samples, hf_token: str, max_seq_len: i
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--samples", type=int, default=1000, help="Number of test samples")
+    parser.add_argument("--samples", type=int, default=1000, help="Total balanced samples (50% vul / 50% safe)")
     args = parser.parse_args()
 
     hf_token = os.environ.get("HF_TOKEN", None)
     
-    print(f"Loading '{DATASET_NAME}' split test[:{args.samples}]...")
-    test_ds = load_dataset(DATASET_NAME, split=f"test[:{args.samples}]")
+    test_ds = load_balanced_dataset(DATASET_NAME, total_samples=args.samples)
 
     results = []
     for model_id in DEFAULT_MODELS:
@@ -129,7 +127,7 @@ def main():
             results.append(res)
 
     print("\n" + "="*85)
-    print(f"               FULL SLM COMPARATIVE LEADERBOARD ({args.samples} SAMPLES)")
+    print(f"          50/50 BALANCED COMPARATIVE LEADERBOARD ({args.samples} SAMPLES)")
     print("="*85)
     print(f"{'Model ID':<38} | {'Acc (%)':<8} | {'Prec':<7} | {'Recall':<7} | {'F1-Score':<8} | {'Latency':<9}")
     print("-" * 85)
