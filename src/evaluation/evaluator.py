@@ -7,29 +7,48 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-# Dataset d'évaluation fixe
 DATASET_NAME = "ayshajavd/code-security-vulnerability-dataset"
+
+# Comprehensive Benchmark Suite
+DEFAULT_MODELS = [
+    "Qwen/Qwen2.5-Coder-3B-Instruct",
+    "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+    "Qwen/Qwen2.5-3B-Instruct",
+    "google/gemma-2-2b-it",
+    "google/codegemma-7b-it",
+]
 
 def evaluate_model(model_id: str, dataset_samples, hf_token: str, max_seq_len: int = 2048):
     print(f"\n==================================================")
     print(f"  Evaluating Model: {model_id}")
     print(f"==================================================")
     
-    tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
+    except Exception as e:
+        print(f"Error loading tokenizer for {model_id}: {e}")
+        return None
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     print("Loading weights onto GPU (FP16)...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, 
-        torch_dtype=torch.float16,
-        device_map="auto",
-        token=hf_token
-    )
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id, 
+            torch_dtype=torch.float16,
+            device_map="auto",
+            token=hf_token
+        )
+    except Exception as e:
+        print(f"Error loading model weights for {model_id}: {e}")
+        return None
 
     y_true = []
     y_pred = []
     latencies = []
+
+    system_prompt = "Vous êtes un agent d'analyse statique de code. Répondez UNIQUEMENT par 'VULNERABLE' ou 'SAFE'."
 
     print(f"Running inference on {len(dataset_samples)} samples...")
     for sample in dataset_samples:
@@ -38,11 +57,19 @@ def evaluate_model(model_id: str, dataset_samples, hf_token: str, max_seq_len: i
         ground_truth = 1 if sample["is_vulnerable"] else 0
         
         messages = [
-            {"role": "user", "content": f"Vous êtes un agent d'analyse statique de code. Répondez UNIQUEMENT par 'VULNERABLE' ou 'SAFE'.\n\nAnalysez la sécurité de ce code {lang} :\n```{lang}\n{code_snippet}\n```"}
+            {"role": "user", "content": f"{system_prompt}\n\nAnalysez la sécurité de ce code {lang} :\n```{lang}\n{code_snippet}\n```"}
         ]
         
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        
+        try:
+            prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            # Fallback ChatML format if chat_template is not present
+            prompt = (
+                f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+                f"<|im_start|>user\nAnalysez la sécurité de ce code {lang} :\n```{lang}\n{code_snippet}\n```<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+            )
+
         inputs = tokenizer(
             prompt, 
             return_tensors="pt", 
@@ -66,12 +93,11 @@ def evaluate_model(model_id: str, dataset_samples, hf_token: str, max_seq_len: i
         y_true.append(ground_truth)
         y_pred.append(prediction)
 
-    # Calcul des métriques
     acc = accuracy_score(y_true, y_pred)
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
-    avg_latency = (sum(latencies) / len(latencies)) * 1000  # ms
+    avg_latency = (sum(latencies) / len(latencies)) * 1000
 
-    # Nettoyage mémoire VRAM pour libérer le GPU avant le modèle suivant
+    # Strict VRAM cleanup between model runs
     del model
     del tokenizer
     gc.collect()
@@ -88,34 +114,28 @@ def evaluate_model(model_id: str, dataset_samples, hf_token: str, max_seq_len: i
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--samples", type=int, default=1000, help="Nombre d'échantillons de test")
+    parser.add_argument("--samples", type=int, default=1000, help="Number of test samples")
     args = parser.parse_args()
 
     hf_token = os.environ.get("HF_TOKEN", None)
     
-    # 1. Chargement unique du dataset pour garantir des données 100% identiques
     print(f"Loading '{DATASET_NAME}' split test[:{args.samples}]...")
     test_ds = load_dataset(DATASET_NAME, split=f"test[:{args.samples}]")
 
-    models_to_benchmark = [
-        "Qwen/Qwen2.5-Coder-3B-Instruct",
-        "google/gemma-2-2b-it"
-    ]
-
     results = []
-    for model_id in models_to_benchmark:
+    for model_id in DEFAULT_MODELS:
         res = evaluate_model(model_id, test_ds, hf_token)
-        results.append(res)
+        if res:
+            results.append(res)
 
-    # 2. Tableau comparatif synthétique
-    print("\n" + "="*80)
-    print(f"          COMPARATIVE BENCHMARK SUMMARY ({args.samples} SAMPLES)")
-    print("="*80)
-    print(f"{'Model ID':<35} | {'Acc (%)':<8} | {'Prec':<7} | {'Recall':<7} | {'F1-Score':<8} | {'Latency':<9}")
-    print("-" * 80)
+    print("\n" + "="*85)
+    print(f"               FULL SLM COMPARATIVE LEADERBOARD ({args.samples} SAMPLES)")
+    print("="*85)
+    print(f"{'Model ID':<38} | {'Acc (%)':<8} | {'Prec':<7} | {'Recall':<7} | {'F1-Score':<8} | {'Latency':<9}")
+    print("-" * 85)
     for r in results:
-        print(f"{r['model_id']:<35} | {r['accuracy']:<8.2f} | {r['precision']:<7.4f} | {r['recall']:<7.4f} | {r['f1']:<8.4f} | {r['latency_ms']:.1f} ms")
-    print("="*80 + "\n")
+        print(f"{r['model_id']:<38} | {r['accuracy']:<8.2f} | {r['precision']:<7.4f} | {r['recall']:<7.4f} | {r['f1']:<8.4f} | {r['latency_ms']:.1f} ms")
+    print("="*85 + "\n")
 
 if __name__ == "__main__":
     main()
