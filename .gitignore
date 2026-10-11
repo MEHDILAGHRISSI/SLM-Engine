@@ -1,0 +1,20 @@
+# Heavy model outputs and checkpoints
+models_cache/
+*.safetensors
+*.pth
+*.bin
+*.pt
+
+# Virtual environments (including nested ones like notebooks/benchmark/venv)
+venv/
+**/venv/
+
+# Raw dataset files
+data/raw/*
+!data/raw/.gitkeep
+
+# Python cache & OS files
+__pycache__/
+*.pyc
+.DS_Store
+.env
