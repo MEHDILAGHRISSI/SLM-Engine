@@ -1,4 +1,5 @@
 import os
+import gc
 import time
 import argparse
 import torch
@@ -6,22 +7,19 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
-def run_benchmark(model_id: str, num_samples: int = 200, max_seq_len: int = 2048):
-    print(f"\n=== Running Baseline Benchmark for: {model_id} ===")
-    
-    # Vérification du token HF pour les modèles protégés (comme Gemma)
-    hf_token = os.environ.get("HF_TOKEN", None)
-    if not hf_token:
-        print("Warning: HF_TOKEN absent. Si le modèle est restreint (ex: Gemma), le chargement échouera.")
+# Dataset d'évaluation fixe
+DATASET_NAME = "ayshajavd/code-security-vulnerability-dataset"
 
-    print(f"Loading test dataset ({num_samples} samples)...")
-    ds = load_dataset("ayshajavd/code-security-vulnerability-dataset", split=f"test[:{num_samples}]")
+def evaluate_model(model_id: str, dataset_samples, hf_token: str, max_seq_len: int = 2048):
+    print(f"\n==================================================")
+    print(f"  Evaluating Model: {model_id}")
+    print(f"==================================================")
     
     tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    print("Loading model onto GPU in FP16...")
+    print("Loading weights onto GPU (FP16)...")
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
         torch_dtype=torch.float16,
@@ -33,8 +31,8 @@ def run_benchmark(model_id: str, num_samples: int = 200, max_seq_len: int = 2048
     y_pred = []
     latencies = []
 
-    print("Running inference...")
-    for sample in ds:
+    print(f"Running inference on {len(dataset_samples)} samples...")
+    for sample in dataset_samples:
         code_snippet = sample["code"]
         lang = sample["language"]
         ground_truth = 1 if sample["is_vulnerable"] else 0
@@ -68,25 +66,56 @@ def run_benchmark(model_id: str, num_samples: int = 200, max_seq_len: int = 2048
         y_true.append(ground_truth)
         y_pred.append(prediction)
 
+    # Calcul des métriques
     acc = accuracy_score(y_true, y_pred)
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average="binary", zero_division=0)
-    avg_latency = sum(latencies) / len(latencies)
+    avg_latency = (sum(latencies) / len(latencies)) * 1000  # ms
 
-    print("\n==========================================")
-    print("       BASELINE BENCHMARK RESULTS         ")
-    print("==========================================")
-    print(f"Model ID:              {model_id}")
-    print(f"Evaluated Samples:     {num_samples}")
-    print(f"Accuracy:              {acc * 100:.2f}%")
-    print(f"Precision:             {precision:.4f}")
-    print(f"Recall:                {recall:.4f}")
-    print(f"F1-Score:              {f1:.4f}")
-    print(f"Avg Latency / Sample:  {avg_latency * 1000:.2f} ms")
+    # Nettoyage mémoire VRAM pour libérer le GPU avant le modèle suivant
+    del model
+    del tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return {
+        "model_id": model_id,
+        "accuracy": acc * 100,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "latency_ms": avg_latency
+    }
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--samples", type=int, default=1000, help="Nombre d'échantillons de test")
+    args = parser.parse_args()
+
+    hf_token = os.environ.get("HF_TOKEN", None)
+    
+    # 1. Chargement unique du dataset pour garantir des données 100% identiques
+    print(f"Loading '{DATASET_NAME}' split test[:{args.samples}]...")
+    test_ds = load_dataset(DATASET_NAME, split=f"test[:{args.samples}]")
+
+    models_to_benchmark = [
+        "Qwen/Qwen2.5-Coder-3B-Instruct",
+        "google/gemma-2-2b-it"
+    ]
+
+    results = []
+    for model_id in models_to_benchmark:
+        res = evaluate_model(model_id, test_ds, hf_token)
+        results.append(res)
+
+    # 2. Tableau comparatif synthétique
+    print("\n" + "="*80)
+    print(f"          COMPARATIVE BENCHMARK SUMMARY ({args.samples} SAMPLES)")
+    print("="*80)
+    print(f"{'Model ID':<35} | {'Acc (%)':<8} | {'Prec':<7} | {'Recall':<7} | {'F1-Score':<8} | {'Latency':<9}")
+    print("-" * 80)
+    for r in results:
+        print(f"{r['model_id']:<35} | {r['accuracy']:<8.2f} | {r['precision']:<7.4f} | {r['recall']:<7.4f} | {r['f1']:<8.4f} | {r['latency_ms']:.1f} ms")
+    print("="*80 + "\n")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="google/gemma-2-2b-it", help="Hugging Face Model ID")
-    parser.add_argument("--samples", type=int, default=200, help="Number of test samples")
-    args = parser.parse_args()
-    
-    run_benchmark(args.model, num_samples=args.samples)
+    main()
