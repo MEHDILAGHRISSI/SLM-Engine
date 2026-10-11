@@ -1,16 +1,23 @@
+import os
 import time
+import argparse
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 def run_benchmark(model_id: str, num_samples: int = 200, max_seq_len: int = 2048):
-    print(f"=== Running Baseline Benchmark for: {model_id} ===")
+    print(f"\n=== Running Baseline Benchmark for: {model_id} ===")
     
+    # Vérification du token HF pour les modèles protégés (comme Gemma)
+    hf_token = os.environ.get("HF_TOKEN", None)
+    if not hf_token:
+        print("Warning: HF_TOKEN absent. Si le modèle est restreint (ex: Gemma), le chargement échouera.")
+
     print(f"Loading test dataset ({num_samples} samples)...")
     ds = load_dataset("ayshajavd/code-security-vulnerability-dataset", split=f"test[:{num_samples}]")
     
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -18,14 +25,13 @@ def run_benchmark(model_id: str, num_samples: int = 200, max_seq_len: int = 2048
     model = AutoModelForCausalLM.from_pretrained(
         model_id, 
         torch_dtype=torch.float16,
-        device_map="auto"
+        device_map="auto",
+        token=hf_token
     )
 
     y_true = []
     y_pred = []
     latencies = []
-
-    system_prompt = "Vous êtes un agent d'analyse statique de code. Répondez UNIQUEMENT par 'VULNERABLE' ou 'SAFE'."
 
     print("Running inference...")
     for sample in ds:
@@ -33,13 +39,12 @@ def run_benchmark(model_id: str, num_samples: int = 200, max_seq_len: int = 2048
         lang = sample["language"]
         ground_truth = 1 if sample["is_vulnerable"] else 0
         
-        prompt = (
-            f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\nAnalysez la sécurité de ce code {lang} :\n```{lang}\n{code_snippet}\n```<|im_end|>\n"
-            f"<|im_start|>assistant\n"
-        )
+        messages = [
+            {"role": "user", "content": f"Vous êtes un agent d'analyse statique de code. Répondez UNIQUEMENT par 'VULNERABLE' ou 'SAFE'.\n\nAnalysez la sécurité de ce code {lang} :\n```{lang}\n{code_snippet}\n```"}
+        ]
         
-        # Tronquage strict à 2048 tokens pour éviter l'explosion mémoire sur les longs extraits
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
         inputs = tokenizer(
             prompt, 
             return_tensors="pt", 
@@ -79,4 +84,9 @@ def run_benchmark(model_id: str, num_samples: int = 200, max_seq_len: int = 2048
     print(f"Avg Latency / Sample:  {avg_latency * 1000:.2f} ms")
 
 if __name__ == "__main__":
-    run_benchmark("Qwen/Qwen2.5-Coder-3B-Instruct", num_samples=200)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="google/gemma-2-2b-it", help="Hugging Face Model ID")
+    parser.add_argument("--samples", type=int, default=200, help="Number of test samples")
+    args = parser.parse_args()
+    
+    run_benchmark(args.model, num_samples=args.samples)
