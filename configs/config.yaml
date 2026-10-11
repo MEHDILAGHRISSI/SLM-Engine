@@ -1,23 +1,34 @@
 model:
-  base_model_id: "Qwen/Qwen2.5-Coder-3B-Instruct"
+  name_or_path: "Qwen/Qwen2.5-Coder-3B-Instruct"
   max_seq_length: 2048
   load_in_4bit: true
 
 lora:
   r: 16
-  alpha: 32
-  dropout: 0  # Optimized for Unsloth
-  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-
-dataset:
-  hf_dataset_name: "hitoshura25/crossvul"
-  target_languages: ["java", "python", "py", "javascript", "js", "go", "php", "c", "cpp"]
-  max_char_length: 3000
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  
+# LoRA+ Hyperparameters
+loraplus:
+  enabled: true
+  lr_ratio: 16.0  # \eta_B / \eta_A ratio (16 is the recommended default)
 
 training:
-  per_device_train_batch_size: 2
+  output_dir: "outputs/qwen-crossvul-loraplus"
+  dataset_name: "hitoshura25/crossvul"
+  per_device_train_batch_size: 4
   gradient_accumulation_steps: 4
-  learning_rate: 0.0002
-  max_steps: 300
-  output_dir: "models_cache/qwen3b_security_lora"
-  hf_repo_id: "YOUR_USERNAME/qwen2.5-coder-3b-security-agent"  # Replace with your HF username
+  learning_rate: 1.0e-4  # \eta_A (Matrix B will use 1.0e-4 * 16 = 1.6e-3)
+  num_train_epochs: 3
+  logging_steps: 10
+  save_strategy: "epoch"
+  bf16: false
+  fp16: true

@@ -1,111 +1,132 @@
+import os
+import yaml
+import argparse
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from peft import LoraConfig
+from unsloth import FastLanguageModel
 from trl import SFTTrainer, SFTConfig
+from transformers import Trainer
 
-# 1. Configuration de la quantification 4-bit NF4 (optimisée NVIDIA T500)
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-)
+class LoRAPlusSFTTrainer(SFTTrainer):
+    """SFTTrainer override implementing the LoRA+ optimizer parameter grouping."""
+    def __init__(self, *args, loraplus_lr_ratio: float = 16.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loraplus_lr_ratio = loraplus_lr_ratio
 
-model_id = "Qwen/Qwen2.5-Coder-0.5B-Instruct"
+    def create_optimizer(self):
+        if self.optimizer is None:
+            decay_parameters = self.get_decay_parameter_names(self.model)
+            param_groups = {"lora_a": [], "lora_b": [], "other": []}
+            
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if "lora_B" in name or "lora_embedding_B" in name:
+                    param_groups["lora_b"].append(param)
+                elif "lora_A" in name or "lora_embedding_A" in name:
+                    param_groups["lora_a"].append(param)
+                else:
+                    param_groups["other"].append(param)
 
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+            base_lr = self.args.learning_rate
+            ratio_lr = base_lr * self.loraplus_lr_ratio
 
-print("Chargement du modèle de base Qwen2.5-Coder-0.5B...")
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    quantization_config=bnb_config,
-    dtype=torch.float16,
-    device_map="auto"
-)
+            optimizer_grouped_parameters = [
+                {"params": param_groups["lora_a"], "lr": base_lr, "weight_decay": self.args.weight_decay},
+                {"params": param_groups["lora_b"], "lr": ratio_lr, "weight_decay": self.args.weight_decay},
+            ]
+            if param_groups["other"]:
+                optimizer_grouped_parameters.append(
+                    {"params": param_groups["other"], "lr": base_lr, "weight_decay": self.args.weight_decay}
+                )
 
-# 2. Configuration LoRA
-peft_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    lora_dropout=0.05,
-    bias="none",
-    task_type="CAUSAL_LM"
-)
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+            
+        return self.optimizer
 
-# 3. Chargement et filtrage du dataset crossvul
-print("Chargement du dataset crossvul depuis Hugging Face...")
-raw_dataset = load_dataset("hitoshura25/crossvul", split="train")
+def train(config_path: str):
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
 
-TARGET_LANGS = ["java", "python", "py", "javascript", "js", "go", "php", "c", "cpp"]
-MAX_CHAR_LENGTH = 2000 
+    print("=== Initializing FastLanguageModel with Unsloth ===")
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=cfg["model"]["name_or_path"],
+        max_seq_length=cfg["model"]["max_seq_length"],
+        load_in_4bit=cfg["model"]["load_in_4bit"],
+        dtype=None,
+    )
 
-filtered_dataset = raw_dataset.filter(
-    lambda x: x["language"] in TARGET_LANGS 
-    and len(x["vulnerable_code"]) <= MAX_CHAR_LENGTH 
-    and len(x["fixed_code"]) <= MAX_CHAR_LENGTH
-)
+    print("=== Applying LoRA Adapters ===")
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r=cfg["lora"]["r"],
+        target_modules=cfg["lora"]["target_modules"],
+        lora_alpha=cfg["lora"]["lora_alpha"],
+        lora_dropout=cfg["lora"]["lora_dropout"],
+        bias="none",
+        use_gradient_checkpointing="unsloth",
+    )
 
-print(f"Nombre d'échantillons retenus : {len(filtered_dataset)}")
+    print(f"=== Loading Fine-Tuning Dataset ({cfg['training']['dataset_name']}) ===")
+    ds = load_dataset(cfg["training"]["dataset_name"], split="train")
 
-# 4. Formatage au format ChatML
-def format_prompts(batch):
-    texts = []
-    for vuln_code, fix_code, cwe, lang in zip(
-        batch["vulnerable_code"], batch["fixed_code"], batch["cwe_id"], batch["language"]
-    ):
-        text_vuln = (
-            f"<|im_start|>system\nVous êtes un agent expert en analyse statique de code.<|im_end|>\n"
-            f"<|im_start|>user\nAnalysez la sécurité de ce code {lang} :\n```{lang}\n{vuln_code}\n```<|im_end|>\n"
-            f"<|im_start|>assistant\nDIAGNOSTIC: Code Vulnérable ({cwe}).\nCorrection suggérée :\n```{lang}\n{fix_code}\n```<|im_end|>"
-        )
-        texts.append(text_vuln)
+    def format_prompts(batch):
+        formatted = []
+        for v_code, f_code, cwe, lang in zip(
+            batch["vulnerable_code"], batch["fixed_code"], batch["cwe_id"], batch["language"]
+        ):
+            # Formulating SFT Instruction Pairs
+            prompt = (
+                f"<|im_start|>system\nVous êtes un agent d'analyse statique et de sécurisation de code.<|im_end|>\n"
+                f"<|im_start|>user\nExaminez ce code {lang} et identifiez s'il est vulnérable ({cwe}) :\n```{lang}\n{v_code}\n```<|im_end|>\n"
+                f"<|im_start|>assistant\nVULNERABLE\nCorrective Patch:\n```{lang}\n{f_code}\n```<|im_end|>"
+            )
+            formatted.append(prompt)
+        return {"text": formatted}
 
-        text_safe = (
-            f"<|im_start|>system\nVous êtes un agent expert en analyse statique de code.<|im_end|>\n"
-            f"<|im_start|>user\nAnalysez la sécurité de ce code {lang} :\n```{lang}\n{fix_code}\n```<|im_end|>\n"
-            f"<|im_start|>assistant\nDIAGNOSTIC: Code Sécurisé. Aucune vulnérabilité critique détectée.<|im_end|>"
-        )
-        texts.append(text_safe)
+    dataset = ds.map(format_prompts, batched=True)
 
-    return {"text": texts}
+    sft_config = SFTConfig(
+        output_dir=cfg["training"]["output_dir"],
+        dataset_text_field="text",
+        max_seq_length=cfg["model"]["max_seq_length"],
+        per_device_train_batch_size=cfg["training"]["per_device_train_batch_size"],
+        gradient_accumulation_steps=cfg["training"]["gradient_accumulation_steps"],
+        learning_rate=cfg["training"]["learning_rate"],
+        num_train_epochs=cfg["training"]["num_train_epochs"],
+        logging_steps=cfg["training"]["logging_steps"],
+        save_strategy=cfg["training"]["save_strategy"],
+        fp16=cfg["training"]["fp16"],
+        bf16=cfg["training"]["bf16"],
+        optim="adamw_8bit",
+        report_to="none",
+    )
 
-formatted_dataset = filtered_dataset.map(
-    format_prompts, 
-    batched=True,
-    remove_columns=raw_dataset.column_names
-)
+    trainer_cls = LoRAPlusSFTTrainer if cfg.get("loraplus", {}).get("enabled", False) else SFTTrainer
+    trainer_kwargs = {"loraplus_lr_ratio": cfg["loraplus"].get("lr_ratio", 16.0)} if cfg.get("loraplus", {}).get("enabled", False) else {}
 
-# 5. Configuration d'entraînement SFT (max_length au lieu de max_seq_length)
-sft_config = SFTConfig(
-    dataset_text_field="text",
-    max_length=1024,
-    per_device_train_batch_size=1,
-    gradient_accumulation_steps=4,
-    max_steps=150,
-    learning_rate=2e-4,
-    fp16=False,
-    bf16=False,
-    gradient_checkpointing=True,
-    logging_steps=10,
-    output_dir="outputs_java_gpu",
-)
+    trainer = trainer_cls(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        args=sft_config,
+        **trainer_kwargs
+    )
 
-trainer = SFTTrainer(
-    model=model,
-    train_dataset=formatted_dataset,
-    peft_config=peft_config,
-    args=sft_config,
-)
+    print("=== Starting Fine-Tuning with LoRA+ ===")
+    trainer.train()
 
-# 6. Exécution du Fine-Tuning
-print("Démarrage du fine-tuning...")
-trainer.train()
+    print("=== Exporting Fine-Tuned Model to 4-Bit GGUF ===")
+    model.save_pretrained_gguf(
+        f"{cfg['training']['output_dir']}-GGUF",
+        tokenizer,
+        quantization_method="q4_k_m"
+    )
+    print("Training and GGUF export complete!")
 
-print("\n--- Fine-tuning GPU terminé avec succès ! ---")
-
-# 7. Sauvegarde des poids LoRA
-model.save_pretrained("outputs_java_gpu/qwen_coder_lora")
-tokenizer.save_pretrained("outputs_java_gpu/qwen_coder_lora")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="configs/config.yaml")
+    args = parser.parse_args()
+    train(args.config)
