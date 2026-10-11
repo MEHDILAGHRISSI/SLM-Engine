@@ -6,7 +6,7 @@ model:
 lora:
   r: 16
   lora_alpha: 32
-  lora_dropout: 0.05
+  lora_dropout: 0  # <--- Set to 0 to enable Unsloth fused Triton kernels
   target_modules:
     - "q_proj"
     - "k_proj"
@@ -15,18 +15,17 @@ lora:
     - "gate_proj"
     - "up_proj"
     - "down_proj"
-  
-# LoRA+ Hyperparameters
+
 loraplus:
   enabled: true
-  lr_ratio: 16.0  # \eta_B / \eta_A ratio (16 is the recommended default)
+  lr_ratio: 16.0
 
 training:
   output_dir: "outputs/qwen-crossvul-loraplus"
   dataset_name: "hitoshura25/crossvul"
   per_device_train_batch_size: 4
   gradient_accumulation_steps: 4
-  learning_rate: 1.0e-4  # \eta_A (Matrix B will use 1.0e-4 * 16 = 1.6e-3)
+  learning_rate: 1.0e-4
   num_train_epochs: 3
   logging_steps: 10
   save_strategy: "epoch"
