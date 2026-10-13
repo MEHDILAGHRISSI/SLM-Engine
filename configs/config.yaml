@@ -1,6 +1,6 @@
 model:
   name_or_path: "Qwen/Qwen2.5-Coder-3B-Instruct"
-  max_seq_length: 1024
+  max_seq_length: 2048      # Porté à 2048 pour capturer les fonctions C/C++ complètes
   load_in_4bit: true
 
 lora:
@@ -16,20 +16,17 @@ lora:
     - "up_proj"
     - "down_proj"
 
-loraplus:
-  enabled: true
-  lr_ratio: 16.0
-
 training:
-  output_dir: "outputs/qwen-crossvul-loraplus"
-  dataset_name: "hitoshura25/crossvul"
-  per_device_train_batch_size: 8   # <--- Passé de 4 à 8 (gain de vitesse sur GPU T4)
-  gradient_accumulation_steps: 2   # <--- Réduit à 2 pour conserver un batch effectif global de 16
-  learning_rate: 1.0e-4
-  num_train_epochs: 1              # <--- MODIFIÉ : 1 époque au lieu de 2 (~3h15 de run au lieu de ~6h50)
+  output_dir: "/content/drive/MyDrive/outputs/qwen-security"
+  dataset_name: "mahdin70/balanced_merged_bigvul_primevul"
+  per_device_train_batch_size: 4  # 4 pour préserver la VRAM T4 avec max_seq_length=2048
+  gradient_accumulation_steps: 4  # Batch effectif global = 16 (4x4)
+  learning_rate: 2.0e-4
+  num_train_epochs: 1
   logging_steps: 10
-  save_strategy: "steps"          # <--- MODIFIÉ : Sauvegarde par étapes au lieu d'époque
-  save_steps: 100                  # <--- AJOUTÉ : Sauvegarde un checkpoint tous les 100 steps
-  save_total_limit: 2              # <--- AJOUTÉ : Garde uniquement les 2 plus récents (évite la saturation du disque)
+  eval_steps: 50
+  save_strategy: "steps"
+  save_steps: 100
+  save_total_limit: 2
   bf16: false
   fp16: true
